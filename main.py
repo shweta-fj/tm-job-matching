@@ -1,95 +1,97 @@
 """
-main.py  --  for each talent manager (TM), score every active job and write one CSV.
+main.py  --  for each job, compare it with ALL the talent managers (TMs).
 
     1. connect to the database (the connection string is in the .env file)
-    2. pull the job list from the database: the latest JOBS_LIMIT jobs whose status is JOB_STATUS
-    3. pull the TM list: TM_IDS, or TM_SAMPLE random TMs who sent candidates through the platform
-    4. for each TM: build the TM's scores once, then score every job against them
-    5. write Output/tm_job_scores_<date_time>.csv  (one row per TM and job, best job first within each TM)
+    2. pull the ids from the database: every TM id, and the next BATCH_JOBS job ids that are not done yet
+    3. build each TM's scores once
+    4. for each job: score every TM for it (percentage and reasons), and save ALL the TMs of that
+       job in Output/<job_title>_<job_id>.json.  Nothing is shown on the screen.
+    5. next run: the next BATCH_JOBS jobs
 
 RUN   python main.py        (needs  pip install numpy sentence-transformers pymongo)
 """
 
-import csv
 import datetime as dt
+import json
 import os
-import random
+import re
 import sys
-import time
 
 import constants as C
 from matching_engine import (Embedder, MongoSource, build_tm, job_record, norm_email, oid, prepare, score_job, vocab_pattern)
 
 
-def pull_jobs(source, vocab_regex):
-    docs = source.latest_jobs(C.JOB_STATUS, C.JOBS_LIMIT)
-    if not docs:
-        sys.exit(f"No jobs with status '{C.JOB_STATUS}' found in jobdescriptions.")
-    return [job_record(d, vocab_regex) for d in docs]
+# ---- which ids are already done (so every run takes new ones)
+def load_progress():
+    try:
+        data = json.load(open(C.PROGRESS_FILE, encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    return {"tms": set(data.get("tms", [])), "jobs": set(data.get("jobs", []))}
 
 
-def pull_tms(source):
-    if C.TM_IDS:                                        # TMs named in constants.py
-        return [source.find_user(ref) for ref in C.TM_IDS]
-    ids = source.list_tm_ids()
-    if C.TM_SAMPLE and len(ids) > C.TM_SAMPLE:
-        ids = random.Random(C.RANDOM_SEED).sample(ids, C.TM_SAMPLE)
-    return source.users_by_ids(ids)
+def mark_done(kind, ids):
+    progress = load_progress()
+    progress[kind] |= set(ids)
+    os.makedirs(C.OUTPUT_DIR, exist_ok=True)
+    json.dump({k: sorted(v) for k, v in progress.items()}, open(C.PROGRESS_FILE, "w", encoding="utf-8"))
 
 
-def reasons(lines):
-    """The reason lines as three CSV cells: what supports the fit (+), the warnings (!), and the neutral notes (~)."""
-    cell = lambda mark: " | ".join(t for m, t in lines if m == mark)
-    return cell("+"), cell("!"), cell("~")
+def next_ids(all_ids, done, size, what):
+    """The first `size` ids (in database order) that are not done yet."""
+    ids = [i for i in all_ids if i not in done]
+    if not ids:
+        sys.exit(f"Every {what} is already done ({len(done)}). Delete {C.PROGRESS_FILE} to start again from the first one.")
+    return ids[:size] if size else ids
 
 
-def rows_for_tm(user, profile, jobs):
-    """Every job scored for one TM, best first, with its rank."""
+# ---- scoring
+def rank_tms(job, tms):
+    """Every TM of the batch scored for one job, best first. tms = list of (user, profile)."""
     scored = []
-    for job in jobs:
+    for user, profile in tms:
         fit, conf, parts, lines = score_job(job, profile)
-        scored.append((fit, conf, parts, lines, job))
+        good, watch, notes = ([t for m, t in lines if m == mark] for mark in ("+", "!", "~"))
+        if fit is None:
+            watch = ["Could not be scored: this TM has no past candidates to learn from"]
+        scored.append((fit, {"tm_id": oid(user["_id"]), "tm_name": user.get("name"), "tm_email": norm_email(user.get("email")),
+                             "past_candidates": profile["n_cands"], "match_percent": None if fit is None else int(round(100 * fit)),
+                             "confidence": conf, "good": good, "watch": watch, "notes": notes,
+                             "parts": {k: round(v, 3) for k, v in parts.items()}}))
     scored.sort(key=lambda s: -(s[0] if s[0] is not None else -1))
-    rows = []
-    for rank, (fit, conf, parts, lines, job) in enumerate(scored, 1):
-        why, watch, notes = reasons(lines)
-        rows.append({"tm_id": oid(user["_id"]), "tm_name": user.get("name") or "", "tm_email": norm_email(user.get("email")) or "",
-                     "tm_candidates": profile["n_cands"], "job_id": job["job_id"], "job_title": job["title"], "role": job["role"],
-                     "level": job["level"] or "", "location": job["location"] or "", "industry": job["industry"] or "",
-                     "rank_for_tm": rank, "in_top_n": "Yes" if fit is not None and rank <= C.TOP_N else "No",
-                     "match_percent": "" if fit is None else int(round(100 * fit)), "confidence": conf,
-                     **{f"part_{k}": "" if k not in parts else round(parts[k], 3) for k in ("role", "level", "skills", "location", "industry")},
-                     "why": why, "watch_out": watch, "notes": notes})
-    return rows
+    return [{"rank": rank, **entry} for rank, (_, entry) in enumerate(scored, 1)]
+
+
+# ---- output
+def save_job(job, ranked):
+    """One JSON file per job with all the TMs, best first."""
+    name = re.sub(r"[^\w\-]+", "_", str(job["title"] or "no_title")).strip("_")[:40]
+    path = os.path.join(C.OUTPUT_DIR, f"{name}_{job['job_id']}.json")
+    data = {"job": {"id": job["job_id"], "title": job["title"], "role": job["role"], "level": job["level"], "location": job["location"],
+                    "industry": job["industry"], "skills": sorted(job["skills"])},
+            "created": dt.datetime.now().isoformat(timespec="seconds"), "tms_compared": len(ranked), "tms": ranked}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    return path
 
 
 def main():
-    sys.stdout.reconfigure(encoding="utf-8")
-    started = time.time()
     source = MongoSource(C.MONGO_URI, C.DATABASE)
     vocab_regex = vocab_pattern(source.skill_vocab())
-    jobs = pull_jobs(source, vocab_regex)
-    tms = pull_tms(source)
-    print(f"{len(tms)} TMs x {len(jobs)} {C.JOB_STATUS} jobs")
-    for u in tms:
-        print(f"  {u.get('name') or '(no name)':30} {oid(u['_id'])}")
-    E = Embedder()
+    job_ids = next_ids(source.list_job_ids(), load_progress()["jobs"], C.BATCH_JOBS, "job")
+    users = source.users_by_ids(source.list_tm_ids())    # ALL the TM ids
+    jobs = [job_record(d, vocab_regex) for d in source.jobs_by_ids(job_ids)]
 
+    E = Embedder()
     os.makedirs(C.OUTPUT_DIR, exist_ok=True)
-    path = os.path.join(C.OUTPUT_DIR, f"tm_job_scores_{dt.datetime.now():%Y%m%d_%H%M%S}.csv")
-    total = 0
-    with open(path, "w", encoding="utf-8-sig", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=C.CSV_COLUMNS)
-        writer.writeheader()
-        for i, user in enumerate(tms, 1):
-            t0 = time.time()
-            profile = build_tm(prepare(source.tm_raw(oid(user["_id"])), vocab_regex), E)
-            rows = rows_for_tm(user, profile, jobs)
-            writer.writerows(rows)
-            f.flush()                                   # a crash later does not lose the TMs already done
-            total += len(rows)
-            print(f"[{i}/{len(tms)}] {user.get('name') or oid(user['_id'])}: {profile['n_cands']} past candidates, {len(rows)} jobs scored ({time.time() - t0:.0f}s)")
-    print(f"\nDone: {total} rows in {(time.time() - started) / 60:.1f} min\n{path}")
+    tms = []
+    for user in users:                                   # each TM's scores are built once and used for every job
+        tms.append((user, build_tm(prepare(source.tm_raw(oid(user["_id"])), vocab_regex), E)))
+
+    for job in jobs:
+        ranked = rank_tms(job, tms)
+        save_job(job, ranked)
+        mark_done("jobs", [job["job_id"]])               # only after its file is saved
 
 
 if __name__ == "__main__":

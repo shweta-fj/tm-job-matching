@@ -28,15 +28,10 @@ MONGO_URI = os.environ.get("MONGO_URI", "")
 DATABASE = os.environ.get("DATABASE", "futurejobsProd")
 
 # ================================================================================================ 2. WHAT TO RUN
-# The talent managers: user ids (the ObjectId('...') of Compass is fine), e-mails or names.  Empty = pulled from the database:
-# the TMs who sent candidates through the platform.
-TM_IDS = []
-TM_SAMPLE = 5                   # when TM_IDS is empty: pick this many of those TMs at random (0 = all of them)
-RANDOM_SEED = None              # a number (for example 42) makes the random pick the same every run; None = different every run
-# The jobs: always pulled from the database, never typed in: the JOBS_LIMIT most recently created jobs whose status is JOB_STATUS.
-JOB_STATUS = "active"
-JOBS_LIMIT = 500
-TOP_N = 5                       # in the CSV, the jobs ranked 1 to TOP_N for each TM are marked in_top_n = Yes
+# No TM id and no job id is typed here: both lists come from the database (the users and jobdescriptions collections, in database order).
+# Each run takes the next BATCH_JOBS job ids that are not done yet, and compares each of those jobs with ALL the TM ids.
+BATCH_JOBS = 15
+PROGRESS_FILE = os.path.join(OUTPUT_DIR, "progress.json")   # the job ids already done, so the next run starts after them (delete it to start again)
 
 # ================================================================================================ 3. THE SCORES (the list confirmed by the team)
 JOB_FIT_WEIGHTS = {"role": 40, "level": 25, "skills": 20, "location": 10, "industry": 5}                              # score 1
@@ -109,7 +104,3 @@ CITY_VARIANTS = {"delhi ncr": ["delhi", "new delhi", "noida", "greater noida", "
 CITY_OF = {v: canon for canon, vs in CITY_VARIANTS.items() for v in vs}
 NOT_CITIES = {"india", "united states", "usa", "us", "uk", "remote", "anywhere", "global", "worldwide", "uae", "canada", "germany", "hybrid", "on-site", "onsite"}
 
-# ================================================================================================ 5. THE OUTPUT CSV
-CSV_COLUMNS = ["tm_id", "tm_name", "tm_email", "tm_candidates", "job_id", "job_title", "role", "level", "location", "industry",
-               "rank_for_tm", "in_top_n", "match_percent", "confidence", "part_role", "part_level", "part_skills", "part_location",
-               "part_industry", "why", "watch_out", "notes"]

@@ -205,13 +205,8 @@ class MongoSource:
 
     # ---- which TMs
     def list_tm_ids(self):
-        """Every TM who sent candidates through the platform (not the old-system 'migrated' ones), the busiest first."""
-        pls = self._find("candidate_placements", {"source": {"$ne": "migrated"}}, {"addedBy": 1, "submittedByGuestId": 1})
-        guests = {oid(p["submittedByGuestId"]) for p in pls if p.get("submittedByGuestId")}
-        mems = self._find("workspace_memberships", {"_id": {"$in": [self.cast(g) for g in guests]}}, {"userId": 1}) if guests else []
-        member_user = {oid(m["_id"]): oid(m.get("userId")) for m in mems}
-        owners = collections.Counter(self.owner_of(p, member_user) for p in pls)
-        return [u for u, _ in owners.most_common() if u]
+        """Every user id in the users collection, as it is in the database: no condition and no ordering."""
+        return [oid(u["_id"]) for u in self._find("users", {}, {"_id": 1})]
 
     def users_by_ids(self, ids):
         docs = self._find("users", {"_id": {"$in": [self.cast(i) for i in ids]}}) if ids else []
@@ -237,10 +232,14 @@ class MongoSource:
         return pool[0]
 
     # ---- which jobs
-    def latest_jobs(self, status, limit):
-        """The `limit` most recently created jobs with this status."""
-        cursor = self.db["jobdescriptions"].find({"status": status}).sort([("createdAt", -1), ("_id", -1)]).limit(limit).allow_disk_use(True)
-        return list(cursor)
+    def list_job_ids(self):
+        """Every job id in jobdescriptions, as it is in the database: no condition and no ordering."""
+        return [oid(j["_id"]) for j in self._find("jobdescriptions", {}, {"_id": 1})]
+
+    def jobs_by_ids(self, ids):
+        docs = self._find("jobdescriptions", {"_id": {"$in": [self.cast(i) for i in ids]}}) if ids else []
+        by_id = {oid(j["_id"]): j for j in docs}
+        return [by_id[i] for i in ids if i in by_id]
 
     # ---- one TM's data
     def tm_raw(self, uid):                              # fetch everything about the TM
@@ -443,36 +442,36 @@ def build_tm(prep, E):
 
 # ================================================================================================ SCORE 1: THE JOB FIT
 def score_job(job, tm):
-    """The five parts of the job fit, and the reasons. Returns (fit 0-1 or None, confidence, parts, reasons)."""
+    """The five parts of the job fit, and the reasons (short and plain). Returns (fit 0-1 or None, confidence, parts, reasons)."""
     parts, lines = {}, []
-    nice = {"role": "Role", "level": "Level", "location": "Location", "industry": "Industry"}
     for dim in ("role", "level", "location", "industry"):
         value, groups = job[dim], tm["groups"][dim]
         if value is None:
             if dim in tm["typical"]:
                 parts[dim] = tm["typical"][dim]
-                lines.append(("~", f"{nice[dim]}: the job does not say, so the TM's typical {dim} score is used"))
+                lines.append(("~", f"The job does not say its {dim}"))
             continue
         if not groups:
             continue                                    # the TM's history says nothing about this property at all
+        where = {"role": f"{value} jobs", "level": f"{value} level jobs", "location": f"jobs in {value}", "industry": f"{value} industry jobs"}[dim]
         g = groups.get(value)
         if g is not None and g["n"] >= MIN_GROUP_CANDIDATES:
             parts[dim] = g["score"]
             typ = tm["typical"].get(dim, g["score"])
-            mark = "+" if g["score"] >= typ * 1.05 else "!" if g["score"] <= typ * 0.9 else "~"
-            text = f"{nice[dim]}: sent {g['n']} candidates for {value} jobs ({g['jobs']} jobs); {100 * g['shortlisted']:.0f}% shortlisted"
-            if g["match100"] is not None:
-                text += f"; matched their job descriptions {g['match100']:.0f}/100"
-            lines.append((mark, text + f" (confidence {g['confidence']})"))
+            if g["score"] >= typ * 1.05:
+                lines.append(("+", f"Did well on {where}"))
+            elif g["score"] <= typ * 0.9:
+                lines.append(("!", f"Weak results on {where}"))
+            else:
+                lines.append(("~", f"Average results on {where}"))
         else:
             parts[dim] = UNSEEN_SCORE
-            lines.append(("!", f"{nice[dim]}: has not worked on {value} jobs before (trial score {UNSEEN_SCORE:.2f})" if g is None else
-                          f"{nice[dim]}: only {g['n']} candidates for {value} jobs ({MIN_GROUP_CANDIDATES} needed), so it counts as a trial"))
+            lines.append(("!", f"Has not worked on {where} before" if g is None else f"Very few candidates for {where} so far"))
     if job["skills"] and tm["good_skills"] and (not job.get("skills_read_from_text") or len(job["skills"]) >= 3):
-        have = sorted(s for s in job["skills"] if s in tm["good_skills"])
+        have = [s for s in job["skills"] if s in tm["good_skills"]]
         parts["skills"] = len(have) / len(job["skills"])
-        lines.append(("+" if parts["skills"] >= 0.5 else "!", f"Skills: {len(have)} of {len(job['skills'])} required skills appeared in jobs where the TM's candidates did well"
-                      + (f" ({', '.join(have[:5])})" if have else "")))
+        lines.append(("+" if parts["skills"] >= 0.5 else "!", f"Knows {len(have)} of the {len(job['skills'])} skills asked" if parts["skills"] >= 0.5
+                      else f"Knows only {len(have)} of the {len(job['skills'])} skills asked"))
     if not parts:
         return None, "Low", parts, lines
     fit = sum(JOB_FIT_WEIGHTS[k] * v for k, v in parts.items()) / sum(JOB_FIT_WEIGHTS[k] for k in parts)
