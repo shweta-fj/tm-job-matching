@@ -1,480 +1,520 @@
 """
-matching_engine.py  --  the logic of the TM / job matching.  No settings here (they are in constants.py) and no printing or files
-(that is main.py).
+matching_engine.py  --  the main steps of the TM / job matching.  The settings are in constants.py, the small helper functions
+are in helper.py, and main.py runs the steps in order.
 
-    MongoSource   reads the database
-    prepare       turns one TM's raw records into past candidates
-    candidate_match (score 3)  ->  build_tm (score 2)  ->  score_job (score 1)
+    MongoSource               reads the data of the database (it never changes anything)
+    prepare_candidates        turns the data of one TM into a list of the TM's past candidates
+    candidate_match_score     score 3: how well one candidate's resume matched the job it was sent for (0 to 100)
+    build_tm_profile          score 2: how well the TM did in each group (one role, level, city or industry)
+    score_job_for_tm          score 1: how well a new job fits the TM (the percentage), with the reasons
 """
 
 import collections
-import datetime as dt
 import json
 import logging
 import os
-import re
 import sys
 import warnings
 
 import numpy as np
 
-from constants import *     # every setting and fixed table
+import constants
+import helper
 
+# The text-model library prints progress bars and notices by default.  These lines keep the screen quiet.
 warnings.filterwarnings("ignore")
-for _k, _v in (("TQDM_DISABLE", "1"), ("HF_HUB_DISABLE_PROGRESS_BARS", "1"), ("TRANSFORMERS_VERBOSITY", "error"), ("HF_HUB_VERBOSITY", "error")):
-    os.environ.setdefault(_k, _v)
-for _name in ("huggingface_hub", "sentence_transformers", "transformers"):
-    logging.getLogger(_name).setLevel(logging.ERROR)
-
-
-# ================================================================================================ small helpers
-def oid(v):
-    """Any id (string, ObjectId, or the {"$oid": ...} of a JSON export) as a plain string."""
-    if isinstance(v, dict):
-        v = v.get("$oid")
-    return None if v is None else str(v)
-
-
-def as_date(v):
-    if isinstance(v, dt.datetime):
-        return v.replace(tzinfo=None)
-    if isinstance(v, dict):
-        v = v.get("$date")
-    try:
-        return dt.datetime.fromisoformat(str(v).replace("Z", "+00:00")).replace(tzinfo=None) if v else None
-    except ValueError:
-        return None
-
-
-def skill_key(name):
-    name = name.get("name") if isinstance(name, dict) else name
-    key = re.sub(r"[_\-/]+", " ", str(name or "").lower())
-    key = re.sub(r"\.js\b", "js", key)
-    key = re.sub(r"[^a-z0-9+#. ]", " ", key)
-    key = re.sub(r"\s+", " ", key).strip(" .")
-    return SYNONYMS.get(key, key)
-
-
-def city_key(text):
-    first = re.split(r"[,/|(]", str(text or "").lower().strip())[0].strip()
-    first = CITY_OF.get(first, first)
-    return None if (not first or first in NOT_CITIES) else first
-
-
-def norm_email(text):
-    m = re.search(r"[\w.+\-]+@[\w\-]+(?:\.[\w\-]+)+", str(text or "").lower())
-    return m.group(0) if m else None
-
-
-def scale(x, lo, hi):
-    return float(np.clip((x - lo) / (hi - lo), 0, 1))
-
-
-def stage_level(name):
-    n = str(name or "").lower().strip()
-    if not n or "reject" in n:
-        return None
-    return next((lvl for lvl, rx in STAGE_LADDER if re.search(rx, n)), None)
-
-
-def user_id_in(text):
-    """The 24-character id from '67d5...' or "ObjectId('67d5...')" as pasted from Compass; None when the text is a name or e-mail."""
-    m = re.fullmatch(r"\s*(?:ObjectId\(\s*)?['\"]?([0-9a-fA-F]{24})['\"]?\s*\)?\s*", str(text))
-    return m.group(1).lower() if m else None
-
-
-# ================================================================================================ role, level, location, industry
-def classify_role(title, hint="", department=None):
-    """Role from the title; else from the category / department text; else from the department code; else 'Other'."""
-    for text in (str(title or "").lower(), str(hint or "").lower()):
-        if text:
-            for name, rx in ROLE_RULES:
-                if re.search(rx, text):
-                    return name
-    return DEPARTMENT_ROLES.get(department, "Other")
-
-
-def level_from(min_years, max_years, text=""):     # for experience
-    """Entry / Mid / Senior / Lead from the years asked, else from words such as 'Mid Level'."""
-    if min_years or max_years:
-        m = min_years or 0
-        return LEVELS[0] if m <= 2 else LEVELS[1] if m <= 6 else LEVELS[2] if m <= 11 else LEVELS[3]
-    t = str(text or "").lower()
-    if not t:
-        return None
-    if re.search(r"intern|fresher|entry|junior|\bjr\b|trainee|graduate|beginner", t):
-        return LEVELS[0]
-    if re.search(r"lead|principal|staff|head|director|architect|manager|executive", t):
-        return LEVELS[3]
-    if re.search(r"senior|\bsr\b", t):
-        return LEVELS[2]
-    if re.search(r"mid|intermediate|associate|experienced", t):
-        return LEVELS[1]
-    return None
-
-
-def job_record(raw, vocab_regex=None):             # puts one database job into a standard form
-    """A job from the database, with its role, level, location and industry."""
-    exp = raw.get("experience") or {}
-    skills = {skill_key(s) for s in (raw.get("mustHaveSkills") or []) + (raw.get("coreSkills") or []) + (raw.get("mandatorySkills") or [])}
-    skills.discard("")
-    description = " ".join([raw.get("summary") or "", " ".join(map(str, raw.get("primaryResponsibilities") or []))])
-    title = raw.get("jobTitle") or ""
-    read = False
-    if not skills and vocab_regex is not None:
-        skills, read = read_job_skills(title + " " + description, vocab_regex), True
-    cities = [c for c in (city_key(g) for g in raw.get("geographicJobLocations") or []) if c]
-    industry = next((str(i).strip().lower() for i in raw.get("industry") or [] if str(i).strip()), None)
-    return {"job_id": oid(raw["_id"]), "title": title, "skills": skills, "skills_read_from_text": read,
-            "exp_min": exp.get("min") or 0, "exp_max": exp.get("max") or 0, "cities": set(cities),
-            "remote": "REMOTE" in str(raw.get("workMode") or raw.get("jobLocation") or "").upper(),
-            "degree": DEGREE_RANK.get(str((raw.get("educationalQualifications") or {}).get("degreeType") or "").lower()),
-            "description": description, "created": as_date(raw.get("createdAt")),
-            "role": classify_role(title, "", raw.get("jobDepartment")), "level": level_from(exp.get("min"), exp.get("max")),
-            "location": cities[0] if cities else None, "industry": industry}
-
-
-def resume_record(r):
-    skills = {skill_key(s) for s in r.get("skills") or []}
-    for level in ("basic", "medium", "advanced"):
-        skills |= {skill_key(s) for s in (r.get("analysedSkills") or {}).get(level) or []}
-    history = r.get("employmentHistory") or []
-    for e in history:
-        skills |= {skill_key(s) for s in e.get("skillsUsedInRole") or []}
-    skills.discard("")
-    titles = [(r.get("currentCompanyDetails") or {}).get("designation")] + [e.get("designation") for e in history[:3]]
-    titles = [t.strip() for t in titles if t and t.strip()]
-    exp = r.get("totalExperience") or {}
-    years = (exp.get("years") or 0) + (exp.get("months") or 0) / 12 if exp else None
-    if years == 0 and history:
-        years = None                                    # 0 years next to a job history means "not filled in"
-    edu = max((DEGREE_RANK.get(str(e.get("educationType") or "").lower(), 0) for e in r.get("educationalBackground") or []), default=0)
-    work = " ".join(str(e.get("workExperienceDescription") or "") for e in history)
-    return {"skills": skills, "title_text": " | ".join(dict.fromkeys(titles)), "years": years, "city": city_key(r.get("currentLocation")),
-            "relocate": {c for c in (city_key(x) for x in r.get("relocationDetails") or []) if c}, "edu_rank": edu or None,
-            "text": (" ".join(titles) + " " + " ".join(sorted(skills)) + " " + work)[:3000]}
-
-
-def job_text(job):                                  # the text used for "meaning" similarity
-    return (job["title"] + ". " + " ".join(sorted(job["skills"])) + ". " + job["description"])[:1500]
-
-
-def vocab_pattern(vocab):
-    words = sorted(vocab, key=len, reverse=True)
-    return re.compile(r"(?<![a-z0-9+#.])(" + "|".join(re.escape(w) for w in words) + r")(?![a-z0-9+#])") if words else None
-
-
-def read_job_skills(text, regex):
-    if regex is None:
-        return set()
-    found = {m.group(1) for m in regex.finditer(text.lower())}
-    return set(sorted(found, key=len, reverse=True)[:15])
+os.environ.setdefault("TQDM_DISABLE", "1")
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+os.environ.setdefault("HF_HUB_VERBOSITY", "error")
+for library_name in ("huggingface_hub", "sentence_transformers", "transformers"):
+    logging.getLogger(library_name).setLevel(logging.ERROR)
 
 
 # ================================================================================================ THE DATABASE
 class MongoSource:
-    """Reads the database (read only)."""
+    """Reads the MongoDB database.  It only reads, it never changes anything."""
 
-    def __init__(self, uri, database):                  # connect to the database
-        if not uri:
+    def __init__(self, connection_string, database_name):
+        """Connects to the database and checks that the connection works."""
+        if not connection_string:
             sys.exit("No database connection string. Paste it after MONGO_URI= in the .env file.")
         try:
             import pymongo
         except ImportError:
             sys.exit("To read the database install pymongo:  pip install pymongo")
-        client = pymongo.MongoClient(uri, serverSelectionTimeoutMS=15000)
+        client = pymongo.MongoClient(connection_string, serverSelectionTimeoutMS=15000)
         try:
             client.admin.command("ping")
-        except Exception as e:
-            sys.exit(f"Could not connect to the database: {type(e).__name__}: {str(e)[:200]}\n"
+        except Exception as error:
+            sys.exit(f"Could not connect to the database: {type(error).__name__}: {str(error)[:200]}\n"
                      f"Check MONGO_URI in the .env file, your network access (IP allow-list) and the user's password.")
-        try:
-            from bson import ObjectId
-            # a 24-character id string must become a real ObjectId: the database stores ids as ObjectId, a plain string matches nothing
-            self.cast = lambda x: ObjectId(x) if re.fullmatch(r"[0-9a-fA-F]{24}", str(x)) else x
-        except ImportError:
-            self.cast = str
-        self.db = client[database]
+        self.database = client[database_name]
 
-    def _find(self, coll, query, fields=None):
-        return list(self.db[coll].find(query, fields) if fields else self.db[coll].find(query))
+    def get_users(self, user_ids): # read the tms # give list of user id text
+        """The users of these ids, in the same order.  An id that is not in the database gives a record with only the id."""
+        found = helper.find_by_ids(self.database, "users", user_ids)
+        user_by_id = {}
+        for user in found:
+            user_by_id[helper.id_as_text(user["_id"])] = user
+        users = []
+        for user_id in user_ids:
+            users.append(user_by_id.get(user_id, {"_id": user_id}))
+        return users
 
-    def owner_of(self, p, member_user):                 # works out which TM sent each candidate
-        guest = oid(p.get("submittedByGuestId"))
-        return member_user.get(guest) if guest else oid(p.get("addedBy"))
+    def get_jobs(self, job_ids): #reads the jobs
+        """The jobs of these ids, in the same order.  An id that is not in the database is skipped."""
+        found = helper.find_by_ids(self.database, "jobdescriptions", job_ids)
+        job_by_id = {}
+        for job in found:
+            job_by_id[helper.id_as_text(job["_id"])] = job
+        jobs = []
+        for job_id in job_ids:
+            if job_id in job_by_id:
+                jobs.append(job_by_id[job_id])
+        return jobs
 
-    # ---- which TMs
-    def list_tm_ids(self):
-        """Every user id in the users collection, as it is in the database: no condition and no ordering."""
-        return [oid(u["_id"]) for u in self._find("users", {}, {"_id": 1})]
+    def get_tm_data(self, tm_id):# everything about one TM
+        """Everything the database knows about one TM: the candidates sent (placements), their resumes and stages, and the jobs."""
+        db = self.database
 
-    def users_by_ids(self, ids):
-        docs = self._find("users", {"_id": {"$in": [self.cast(i) for i in ids]}}) if ids else []
-        by_id = {oid(u["_id"]): u for u in docs}
-        return [by_id.get(i, {"_id": i}) for i in ids]
+        # The TM's workspace memberships.  A candidate can be sent through a membership instead of the TM's own id.
+        memberships = helper.find_all(db, "workspace_memberships", {"userId": helper.to_object_id(tm_id)})
+        membership_ids = [helper.id_as_text(membership["_id"]) for membership in memberships]
+        member_to_user = {}
+        for membership_id in membership_ids:
+            member_to_user[membership_id] = tm_id
 
-    def find_user(self, ref):
-        """One user from an id, an e-mail or part of a name."""
-        uid = user_id_in(ref)
-        if uid:
-            hits = self._find("users", {"_id": self.cast(uid)})
-        else:
-            rx = {"$regex": re.escape(ref.strip()), "$options": "i"}
-            hits = self._find("users", {"$or": [{"email": rx}, {"name": rx}]})[:50]
-        ref_l = (uid or ref).lower().strip()
-        exact = [u for u in hits if oid(u["_id"]) == ref_l or norm_email(u.get("email")) == ref_l or str(u.get("name") or "").lower() == ref_l]
-        pool = exact if len(exact) == 1 else hits
-        if not pool:
-            sys.exit(f"No TM found for '{ref}'. Use the user id, the e-mail, or part of the name.")
-        if len(pool) > 1:
-            rows = "\n".join(f"  {str(u.get('name') or '(no name)'):28} {u.get('email') or '':38} id {oid(u['_id'])}" for u in pool[:20])
-            sys.exit(f"More than one TM matches '{ref}'. Use the user id or the e-mail:\n{rows}")
-        return pool[0]
+        # The jobs assigned to this TM.
+        assigned_job_ids = set()
+        for membership in memberships:
+            access = membership.get("accessScope") or {}
+            for job_id in access.get("atsJobs") or []:
+                assigned_job_ids.add(helper.id_as_text(job_id))
 
-    # ---- which jobs
-    def list_job_ids(self):
-        """Every job id in jobdescriptions, as it is in the database: no condition and no ordering."""
-        return [oid(j["_id"]) for j in self._find("jobdescriptions", {}, {"_id": 1})]
+        # The placements: one candidate sent for one job.  The ones with source "migrated" (the old system) are left out.
+        sent_by = [{"addedBy": helper.to_object_id(tm_id)}]
+        if membership_ids:
+            sent_by.append({"submittedByGuestId": {"$in": [helper.to_object_id(i) for i in membership_ids]}})
+        query = {"$or": sent_by, "source": {"$ne": "migrated"}} # or -either condition for addedby and submittedby
+        # ne- not equal 
+        placements = []
+        for placement in helper.find_all(db, "candidate_placements", query): # the list of tm placements
+            if helper.find_owner(placement, member_to_user) == tm_id:
+                placements.append(placement)
 
-    def jobs_by_ids(self, ids):
-        docs = self._find("jobdescriptions", {"_id": {"$in": [self.cast(i) for i in ids]}}) if ids else []
-        by_id = {oid(j["_id"]): j for j in docs}
-        return [by_id[i] for i in ids if i in by_id]
+        # The stage history of these placements, and the names of all the stages used.
+        history_rows = helper.find_by_ids(db, "placement_stage_histories", helper.unique_values(placements, "_id"), "placementId")
+        history_by_placement = collections.defaultdict(list)
+        for row in history_rows:
+            history_by_placement[helper.id_as_text(row["placementId"])].append(row)
+        #collect every stage id used, current stage of each placement     
+        stage_ids = set(helper.unique_values(placements, "stageId"))
+        for row in history_rows:
+            for field_name in ("toStageId", "fromStageId"):
+                if row.get(field_name):
+                    stage_ids.add(helper.id_as_text(row[field_name]))
+        stages = {}
+        for stage in helper.find_by_ids(db, "pipeline_stages", list(stage_ids)):
+            stages[helper.id_as_text(stage["_id"])] = stage
 
-    # ---- one TM's data
-    def tm_raw(self, uid):                              # fetch everything about the TM
-        mems = self._find("workspace_memberships", {"userId": self.cast(uid)})
-        mids = [oid(m["_id"]) for m in mems]
-        assigned = {oid(j) for m in mems for j in (m.get("accessScope") or {}).get("atsJobs") or []}
-        query = {"$or": [{"addedBy": self.cast(uid)}] + ([{"submittedByGuestId": {"$in": [self.cast(i) for i in mids]}}] if mids else []),
-                 "source": {"$ne": "migrated"}}
-        member_user = {m: uid for m in mids}
-        pls = [p for p in self._find("candidate_placements", query) if self.owner_of(p, member_user) == uid]
-        ids = lambda key: list({oid(p.get(key)) for p in pls if p.get(key)})
-        hist_docs = self._find("placement_stage_histories", {"placementId": {"$in": [self.cast(i) for i in ids("_id")]}}) if pls else []
-        history = collections.defaultdict(list)
-        for h in hist_docs:
-            history[oid(h["placementId"])].append(h)
-        stage_ids = set(ids("stageId")) | {oid(h.get(k)) for h in hist_docs for k in ("toStageId", "fromStageId") if h.get(k)}
-        job_ids = set(ids("jobId")) | assigned
-        job_docs = {oid(j["_id"]): j for j in self._find("jobdescriptions", {"_id": {"$in": [self.cast(i) for i in job_ids]}})}
-        worked = set(ids("jobId"))
-        return {"placements": pls, "assigned": assigned, "history": history,
-                "resumes": {oid(r["_id"]): r for r in self._find("resumes", {"_id": {"$in": [self.cast(i) for i in ids("resumeId")]}})},
-                "jobs": {j: d for j, d in job_docs.items() if j in worked}, "assigned_jobs": {j: d for j, d in job_docs.items() if j in assigned},
-                "stages": {oid(s["_id"]): s for s in self._find("pipeline_stages", {"_id": {"$in": [self.cast(i) for i in stage_ids]}})}}
+        # The resumes of the candidates.
+        resumes = {}
+        for resume in helper.find_by_ids(db, "resumes", helper.unique_values(placements, "resumeId")):
+            resumes[helper.id_as_text(resume["_id"])] = resume
 
-    def skill_vocab(self):
-        """Skill names that appear in at least 5 jobs (from coreSkills and mustHaveSkills); used to read skills out of job text when a job lists none."""
-        cache = os.path.join(OUTPUT_DIR, "skill_vocab.json")
-        if os.path.exists(cache):
-            return set(json.load(open(cache, encoding="utf-8")))
-        names = {"$map": {"input": {"$concatArrays": [{"$ifNull": ["$coreSkills", []]}, {"$ifNull": ["$mustHaveSkills", []]}]},
-                          "as": "x", "in": {"$ifNull": ["$$x.name", "$$x"]}}}
-        pipeline = [{"$project": {"s": {"$setUnion": [names, []]}}}, {"$unwind": "$s"}, {"$group": {"_id": "$s", "n": {"$sum": 1}}}]
-        count = collections.Counter()
-        for row in self.db["jobdescriptions"].aggregate(pipeline):
-            count[skill_key(row["_id"])] += row["n"]
-        vocab = {s for s, n in count.items() if n >= 5 and len(s) >= 3}
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-        json.dump(sorted(vocab), open(cache, "w", encoding="utf-8"))
-        return vocab
+        # The jobs the TM sent candidates for, and the jobs assigned to the TM.
+        worked_job_ids = set(helper.unique_values(placements, "jobId"))
+        all_job_ids = list(worked_job_ids | assigned_job_ids)
+        worked_jobs = {}
+        assigned_jobs = {}
+        for job in helper.find_by_ids(db, "jobdescriptions", all_job_ids):
+            job_id = helper.id_as_text(job["_id"])
+            if job_id in worked_job_ids:
+                worked_jobs[job_id] = job
+            if job_id in assigned_job_ids:
+                assigned_jobs[job_id] = job
+
+        return {"placements": placements, "history_by_placement": history_by_placement, "stages": stages, "resumes": resumes,
+                "worked_jobs": worked_jobs, "assigned_jobs": assigned_jobs}
+
+    def get_skill_list(self):
+        """The skill names that appear in at least 5 jobs.  They are used to find skills in the text of a job that lists none.
+        The list is saved in a file after the first time, so the next runs do not count again."""
+        cache_file = os.path.join(constants.OUTPUT_DIR, "skill_list.json")
+        if os.path.exists(cache_file):
+            return set(json.load(open(cache_file, encoding="utf-8")))
+
+        # Ask the database to count how many jobs list each skill (coreSkills and mustHaveSkills).
+        both_lists = {"$concatArrays": [{"$ifNull": ["$coreSkills", []]}, {"$ifNull": ["$mustHaveSkills", []]}]}
+        skill_names = {"$map": {"input": both_lists, "as": "skill", "in": {"$ifNull": ["$$skill.name", "$$skill"]}}}
+        steps = [{"$project": {"skills": {"$setUnion": [skill_names, []]}}}, #union-keep each job’s skills without repeats 
+                 {"$unwind": "$skills"},# give one row per skill
+                 {"$group": {"_id": "$skills", "jobs": {"$sum": 1}}}]
+        job_count = collections.Counter()
+        for row in self.database["jobdescriptions"].aggregate(steps):
+            job_count[helper.clean_skill(row["_id"])] += row["jobs"]
+
+        skill_list = set()
+        for skill, count in job_count.items():
+            if count >= 5 and len(skill) >= 3:
+                skill_list.add(skill)
+        os.makedirs(constants.OUTPUT_DIR, exist_ok=True)
+        json.dump(sorted(skill_list), open(cache_file, "w", encoding="utf-8"))
+        return skill_list
 
 
 # ================================================================================================ THE TM'S PAST CANDIDATES
-def prepare(raw, vocab_regex):     # turns the TM's raw records into candidates with stage, early rejection, test result and review
-    """Raw records -> the TM's past jobs and candidates, each candidate with the stage reached, early rejection, test result and team review."""
-    stages = raw["stages"]
-    jobs = {jid: job_record(doc, vocab_regex) for jid, doc in raw["jobs"].items()}
-    assigned = {jid: job_record(doc, vocab_regex) for jid, doc in raw.get("assigned_jobs", {}).items()}
-    name_of = lambda sid_: str((stages.get(oid(sid_)) or {}).get("name") or "")
-    cands = []
-    for p in raw["placements"]:
-        pid, rid, jid = oid(p["_id"]), oid(p.get("resumeId")), oid(p.get("jobId"))
-        if rid not in raw["resumes"] or jid not in jobs:
-            continue
-        hist = raw["history"].get(pid, [])
-        names = [name_of(p.get("stageId"))] + [name_of(h.get("toStageId")) for h in hist] + [name_of(h.get("fromStageId")) for h in hist]
-        levels = [stage_level(n) for n in names]
-        level = max((l for l in levels if l), default=1)
-        current = stages.get(oid(p.get("stageId"))) or {}
-        rejected = (current.get("terminalOutcome") == "rejected" and bool(current.get("isTerminal"))) or "reject" in name_of(p.get("stageId")).lower()
-        if current.get("terminalOutcome") == "hired" and current.get("isTerminal"):
-            level = TOP_LEVEL
-        reasons = {str((p.get("capturedDetails") or {}).get("rejectionReason") or "").lower()}
-        reasons |= {str((h.get("metadata") or {}).get("rejectionReason") or "").lower() for h in hist}
-        reasons |= {"existing-micro1-user" for h in hist if "existing-micro1-user" in str(h.get("note") or "").lower()}
-        early = bool(reasons & EARLY_REASONS) or (rejected and level <= SHORTLIST_LEVEL)
-        took_test = 4 in levels or "failed_ai_interview" in reasons
-        if not took_test:
-            test = None
-        elif any("certified" in n.lower() for n in names) or level >= 5:
-            test = True
-        elif "failed_ai_interview" in reasons or (rejected and level == 4):
-            test = False
-        else:
-            test = None                                 # took it, no verdict yet
-        review = str(p.get("reviewStatus") or "").lower()
-        cands.append({"pid": pid, "resume_id": rid, "job_id": jid, "job": jobs[jid], "created": as_date(p.get("createdAt")),
-                      "rec": resume_record(raw["resumes"][rid]), "level": level, "early": early, "test": test,
-                      "shortlisted": level >= SHORTLIST_LEVEL and not early,
-                      "approved": (1.0 if review == "approved" else 0.0) if review in ("approved", "rejected", "needs_more_info") else None})
-    return {"cands": cands, "jobs": jobs, "assigned": assigned}
+def prepare_candidates(tm_data, skill_pattern): # turn raw data(get tm data) into clean list of tm past candidates
+    """Turns the data of one TM into the list of the TM's past candidates.
+    For each candidate it works out: the stage reached, if rejected early, the test result and the team review."""
+    stages = tm_data["stages"]
+    worked_jobs = {}
+    for job_id, raw_job in tm_data["worked_jobs"].items():
+        worked_jobs[job_id] = helper.make_job(raw_job, skill_pattern)
+    assigned_jobs = {}
+    for job_id, raw_job in tm_data["assigned_jobs"].items():
+        assigned_jobs[job_id] = helper.make_job(raw_job, skill_pattern)
+
+    candidates = []
+    for placement in tm_data["placements"]:
+        placement_id = helper.id_as_text(placement["_id"])
+        resume_id = helper.id_as_text(placement.get("resumeId"))
+        job_id = helper.id_as_text(placement.get("jobId"))
+        if resume_id not in tm_data["resumes"] or job_id not in worked_jobs:
+            continue                    # without the resume or the job there is nothing to compare
+
+        # All the stage names this candidate has been in: the current one, and the ones before and after in the history.
+        history = tm_data["history_by_placement"].get(placement_id, [])# list of stages changes
+        current_name = helper.stage_name(stages, placement.get("stageId")) # on which stage candidate is now
+        stage_names = [current_name]
+        for row in history:
+            stage_names.append(helper.stage_name(stages, row.get("toStageId")))
+        for row in history:
+            stage_names.append(helper.stage_name(stages, row.get("fromStageId")))
+
+        # The highest stage reached (1 to 7).
+        # give no. to each stage and takes the highest.
+        levels = []
+        for name in stage_names:
+            level = helper.stage_to_level(name)
+            if level:
+                levels.append(level)
+        stage_level = 1
+        if levels:
+            stage_level = max(levels)
+        current_stage = stages.get(helper.id_as_text(placement.get("stageId"))) or {}
+        is_final_stage = bool(current_stage.get("isTerminal"))
+        if current_stage.get("terminalOutcome") == "hired" and is_final_stage:
+            stage_level = constants.HIRED_LEVEL
+        rejected = "reject" in current_name.lower()
+        if current_stage.get("terminalOutcome") == "rejected" and is_final_stage:
+            rejected = True
+
+        # The reasons the candidate was rejected for.
+        rejection_reasons = {str((placement.get("capturedDetails") or {}).get("rejectionReason") or "").lower()}
+        for row in history:
+            rejection_reasons.add(str((row.get("metadata") or {}).get("rejectionReason") or "").lower())
+            if "existing-micro1-user" in str(row.get("note") or "").lower():
+                rejection_reasons.add("existing-micro1-user")
+        # early rejection - duplicate” or “underqualified”, or a rejection at the first two stages.       
+        rejected_early = bool(rejection_reasons & constants.EARLY_REJECTION_REASONS)
+        if rejected and stage_level <= constants.SHORTLIST_LEVEL:
+            rejected_early = True
+
+        candidates.append({
+            "resume_id": resume_id,
+            "job_id": job_id,
+            "job": worked_jobs[job_id],
+            "created_at": helper.to_date(placement.get("createdAt")),
+            "resume": helper.make_resume(tm_data["resumes"][resume_id]),
+            "stage_level": stage_level,
+            "rejected_early": rejected_early,
+            # true-passed, false- failed, none-notest or no result yet
+            "test_result": helper.find_test_result(stage_names, stage_level, rejected, rejection_reasons),
+            # reach stage 2 or higher and not rejected early.
+            "shortlisted": stage_level >= constants.SHORTLIST_LEVEL and not rejected_early,
+            #team review: 1.0 approved, 0.0 rejected or needs more info, None not reviewed.
+            "approved": helper.find_approval(placement.get("reviewStatus")),
+        })
+    return {"candidates": candidates, "worked_jobs": worked_jobs, "assigned_jobs": assigned_jobs}
 
 
-def pool_of(cands):     # one entry per resume, so a resume sent to two jobs is not counted twice
-    """The TM's pool of past candidates: one entry per resume."""
-    seen, out = set(), []
-    for c in cands:
-        if c["resume_id"] not in seen:
-            seen.add(c["resume_id"])
-            out.append(c)
-    return out
-
-
-class Embedder:     # the free local model for title and meaning similarity
-    """Sentence meaning with a free local model; every text is encoded once (the cache is kept across TMs)."""
-
+# ================================================================================================ THE TEXT MODEL
+class Embedder:
+    """Turns a text into numbers (a vector) so that two texts can be compared by meaning.  It uses a free model that runs on this computer.
+    Every text is turned into numbers only once; the result is remembered."""
+# used in build tm  profile , first call add text
+# used in candidate match score , here cll vector of
     def __init__(self):
         try:
-            from sentence_transformers import SentenceTransformer
-            self.model = SentenceTransformer("all-MiniLM-L6-v2")
+            from sentence_transformers  import SentenceTransformer  # tool
+            self.model = SentenceTransformer("all-MiniLM-L6-v2") #model
         except Exception:
             sys.exit("This script needs sentence-transformers:  pip install sentence-transformers")
-        self.cache = {}
+        self.vectors = {}
 
-    def warm(self, texts):
-        new = sorted({t for t in texts if t and t not in self.cache})
-        if new:
-            for t, v in zip(new, self.model.encode(new, batch_size=64, normalize_embeddings=True, show_progress_bar=False)):
-                self.cache[t] = v
+    def add_texts(self, texts):
+        """Turns many texts into numbers in one go (faster than one by one)."""
+        new_texts = sorted({text for text in texts if text and text not in self.vectors})
+        if not new_texts:
+            return
+        new_vectors = self.model.encode(new_texts, batch_size=64, normalize_embeddings=True, show_progress_bar=False)
+        for text, vector in zip(new_texts, new_vectors):
+            self.vectors[text] = vector
 
-    def vec(self, text):
-        self.warm([text])
-        return self.cache[text]
+    def vector_of(self, text):
+        """The numbers of one text."""
+        self.add_texts([text])
+        return self.vectors[text]
 
 
 # ================================================================================================ SCORE 3: CANDIDATE MATCH
-def candidate_match(rec, job, E):
-    """One resume against the job it was sent for, 0-100 (skills 40, experience 25, title 15, location 10, education 5, meaning 5)."""
-    parts = {}
-    if job["skills"]:
-        parts["skills"] = 100 * len(rec["skills"] & job["skills"]) / len(job["skills"])
-    if rec["years"] is not None and (job["exp_min"] or job["exp_max"]):
-        lo, hi = job["exp_min"], (job["exp_max"] if job["exp_max"] > job["exp_min"] else None)
-        parts["experience"] = max(0.0, 100 - 25 * (lo - rec["years"])) if rec["years"] < lo else \
-            (max(0.0, 100 - 10 * (rec["years"] - hi)) if hi is not None and rec["years"] > hi else 100.0)
-    if rec["title_text"] and job["title"]:
-        parts["title"] = 100 * scale(float(E.vec(rec["title_text"]) @ E.vec(job["title"])), *TITLE_ANCHORS)
-    if job["cities"] and not job["remote"] and rec["city"]:
-        parts["location"] = 100.0 if rec["city"] in job["cities"] else 70.0 if rec["relocate"] & job["cities"] else 30.0
-    if job["degree"] and rec["edu_rank"]:
-        parts["education"] = 100.0 if rec["edu_rank"] >= job["degree"] else 60.0 if rec["edu_rank"] == job["degree"] - 1 else 20.0
-    if rec["text"]:
-        parts["meaning"] = max(0.0, float(E.vec(rec["text"]) @ E.vec(job_text(job)))) * 100
-    total = sum(MATCH_WEIGHTS[k] for k in parts)
-    return sum(MATCH_WEIGHTS[k] * v for k, v in parts.items()) / total if total else None
+def candidate_match_score(resume, job, embedder):
+    """How well one resume matched the job it was sent for, from 0 to 100.
+    Skills 40, experience 25, title 15, location 10, education 5, meaning 5.  A part with no data is left out and the others share its weight."""
+    scores = {}
+
+    if job["skills"]: # weight -40
+        matching_skills = resume["skills"] & job["skills"]
+        scores["skills"] = 100 * len(matching_skills) / len(job["skills"])
+
+    if resume["years"] is not None and (job["min_years"] or job["max_years"]): #weight -25
+        low = job["min_years"]
+        high = None
+        if job["max_years"] > job["min_years"]:
+            high = job["max_years"]
+        if resume["years"] < low:
+            scores["experience"] = max(0.0, 100 - 25 * (low - resume["years"]))        # 25 points lost for each missing year
+        elif high is not None and resume["years"] > high:
+            scores["experience"] = max(0.0, 100 - 10 * (resume["years"] - high))       # 10 points lost for each extra year
+        else:
+            scores["experience"] = 100.0
+
+    if resume["title_text"] and job["title"]: #weight - 15
+        similarity = float(embedder.vector_of(resume["title_text"]) @ embedder.vector_of(job["title"]))
+        scores["title"] = 100 * helper.scale_0_to_1(similarity, *constants.TITLE_SIMILARITY_RANGE)
+
+    if job["cities"] and not job["remote"] and resume["city"]: #weight -10
+        if resume["city"] in job["cities"]:
+            scores["location"] = 100.0                              # the candidate lives in the job's city
+        elif resume["relocation_cities"] & job["cities"]:
+            scores["location"] = 70.0                               # the candidate is open to move there
+        else:
+            scores["location"] = 30.0
+
+    if job["degree"] and resume["degree_rank"]: #weight -5
+        if resume["degree_rank"] >= job["degree"]:
+            scores["education"] = 100.0
+        elif resume["degree_rank"] == job["degree"] - 1:
+            scores["education"] = 60.0
+        else:
+            scores["education"] = 20.0
+
+    if resume["text"]: #weight-5
+        similarity = float(embedder.vector_of(resume["text"]) @ embedder.vector_of(helper.job_text(job)))
+        scores["meaning"] = max(0.0, similarity) * 100
+
+    weights = constants.CANDIDATE_MATCH_WEIGHTS
+    total_weight = sum(weights[name] for name in scores)
+    if total_weight == 0:
+        return None
+    return sum(weights[name] * scores[name] for name in scores) / total_weight
 
 
-# ================================================================================================ SCORE 2: THE TM SCORE PER GROUP
-def build_tm(prep, E):
-    """The TM's groups. A group = one role, one level, one location or one industry. Each gets a TM score from the TM's own candidates."""
-    cands = prep["cands"]
-    if not cands:                                       # nothing to learn from: no groups, so no job can be scored
-        return {"groups": {d: {} for d in ("role", "level", "location", "industry")}, "typical": {}, "good_skills": collections.Counter(),
-                "n_pool": 0, "n_jobs": 0, "n_cands": 0}
-    E.warm([c["rec"]["text"] for c in cands] + [c["rec"]["title_text"] for c in cands] + [j["title"] for j in prep["jobs"].values()]
-           + [job_text(j) for j in prep["jobs"].values()])
-    for c in cands:
-        c["match"] = candidate_match(c["rec"], c["job"], E)
+# ================================================================================================ SCORE 2: THE TM SCORE OF A GROUP
+def calculate_group_score(group_candidates, group_type, group_value, tm_facts): #group type-role 
+    """The TM score (0 to 1) of one group, for example the group "Backend" of the type "role".
+    group_candidates are the TM's past candidates of this group.  tm_facts holds numbers that are the same for the whole TM."""
+    job_ids = {candidate["job_id"] for candidate in group_candidates}
+    factors = {}
 
-    by_job = collections.defaultdict(list)              # the candidates grouped by job
-    for c in cands:
-        by_job[c["job_id"]].append(c)
-    days = {}
-    for jid, cs in by_job.items():                      # speed: days from the job being created to the TM's first submission
-        first, created = min((c["created"] for c in cs if c["created"]), default=None), cs[0]["job"]["created"]
-        if first and created and 0 <= (first - created).total_seconds() / 86400 <= SPEED_WINDOW_DAYS:
-            days[jid] = (first - created).total_seconds() / 86400
-    median_per_job = max(float(np.median([len(cs) for cs in by_job.values()])), 1.0)
-    typical_days = max(float(np.median(list(days.values()))) if days else 1.0, 1.0)
-    worked = set(by_job)
+    # How far the candidates got in the hiring stages (the stage reached divided by 7).
+    factors["progress"] = helper.average_or_none([c["stage_level"] / constants.HIRED_LEVEL for c in group_candidates])
+    # The share of candidates who passed the test or AI interview (only the ones with a known result).
+    factors["test"] = helper.average_or_none([float(c["test_result"]) for c in group_candidates if c["test_result"] is not None])
+    # The average candidate match score (score 3) divided by 100.
+    factors["match"] = helper.average_or_none([c["match_score"] / 100 for c in group_candidates if c["match_score"] is not None])
+    # The share approved by the team (only the candidates that were reviewed).
+    factors["approval"] = helper.average_or_none([c["approved"] for c in group_candidates if c["approved"] is not None])
+    # How few were rejected early: 1 means none.
+    factors["early"] = helper.average_or_none([1.0 - c["rejected_early"] for c in group_candidates])
+    # Candidates per job, compared with the TM's own typical number (1 is the most).
+    candidates_per_job = len(group_candidates) / len(job_ids)
+    factors["volume"] = min(candidates_per_job / tm_facts["typical_candidates_per_job"], 1.0)
 
-    def mean_or_none(vals):                             # plain average of real data; None when there is nothing to average
-        return float(np.mean(vals)) if vals else None
+    # Of the jobs assigned to the TM in this group, the share the TM sent candidates for.
+    assigned_in_group = set()
+    for job_id, job in tm_facts["assigned_jobs"].items():
+        if job[group_type] == group_value:
+            assigned_in_group.add(job_id)
+    if assigned_in_group:
+        factors["coverage"] = len(assigned_in_group & tm_facts["worked_job_ids"]) / len(assigned_in_group)
+    else:
+        factors["coverage"] = None
 
-    def stats(rows, dim, value):
-        jids = {c["job_id"] for c in rows}
-        f = {"progress": mean_or_none([c["level"] / TOP_LEVEL for c in rows]),
-             "test": mean_or_none([float(c["test"]) for c in rows if c["test"] is not None]),
-             "match": mean_or_none([c["match"] / 100 for c in rows if c["match"] is not None]),
-             "approval": mean_or_none([c["approved"] for c in rows if c["approved"] is not None]),
-             "early": mean_or_none([1.0 - c["early"] for c in rows]),
-             "volume": min(len(rows) / len(jids) / median_per_job, 1.0)}
-        given = {j for j, rec in prep["assigned"].items() if rec[dim] == value}
-        f["coverage"] = len(given & worked) / len(given) if given else None
-        d = [days[j] for j in jids if j in days]
-        f["speed"] = float(np.clip(1 - np.median(d) / (2 * typical_days), 0, 1)) if d else None
-        have = {k: v for k, v in f.items() if v is not None}
-        n = len(rows)
-        return {"n": n, "jobs": len(jids), "score": sum(TM_WEIGHTS[k] * v for k, v in have.items()) / sum(TM_WEIGHTS[k] for k in have),
-                "factors": have, "confidence": "Low" if n < 5 else "Medium" if n <= 15 else "High",
-                "shortlisted": sum(c["shortlisted"] for c in rows) / n,
-                "match100": float(np.mean([c["match"] for c in rows if c["match"] is not None])) if any(c["match"] is not None for c in rows) else None}
+    # Speed: days from the job being created to the first candidate sent, compared with the TM's own typical days.
+    days = []
+    for job_id in job_ids:
+        if job_id in tm_facts["days_to_first_submission"]:
+            days.append(tm_facts["days_to_first_submission"][job_id])
+    if days:
+        factors["speed"] = float(np.clip(1 - np.median(days) / (2 * tm_facts["typical_days"]), 0, 1))
+    else:
+        factors["speed"] = None
 
+    # The score: the weighted average of the factors that have data (a missing factor is left out and the others share its weight).
+    weights = constants.TM_SCORE_WEIGHTS
+    known = {}
+    for name, value in factors.items():
+        if value is not None:
+            known[name] = value
+    score = sum(weights[name] * known[name] for name in known) / sum(weights[name] for name in known)
+
+    count = len(group_candidates)
+    if count < 5:
+        confidence = "Low"
+    elif count <= 15:
+        confidence = "Medium"
+    else:
+        confidence = "High"
+    matches = [c["match_score"] for c in group_candidates if c["match_score"] is not None]
+    average_match = None
+    if matches:
+        average_match = float(np.mean(matches))
+    return {"candidates": count, "jobs": len(job_ids), "score": score, "confidence": confidence,
+            "shortlisted_share": sum(c["shortlisted"] for c in group_candidates) / count, "average_match": average_match}
+
+
+def build_tm_profile(prepared, embedder):#TELL WHAT TM IS GOOD AT
+    """The profile of one TM: the TM score of every group the TM has worked in (score 2).
+    A group is one role, one level, one city or one industry, for example "Backend" or "bangalore"."""
+    candidates = prepared["candidates"]
+    if not candidates:                  # no past candidates: there is nothing to learn from, so no job can be scored
+        empty_groups = {group_type: {} for group_type in constants.GROUP_TYPES}#group- role, level,location,industry
+        return {"groups": empty_groups, "typical_scores": {}, "good_skills": collections.Counter(), "past_candidates": 0}
+
+    # Step 1: the match score (score 3) of every past candidate.
+    texts = []
+    for candidate in candidates:
+        texts.append(candidate["resume"]["text"])
+        texts.append(candidate["resume"]["title_text"])
+    for job in prepared["worked_jobs"].values():
+        texts.append(job["title"])
+        texts.append(helper.job_text(job))
+    embedder.add_texts(texts)
+    for candidate in candidates:
+        candidate["match_score"] = candidate_match_score(candidate["resume"], candidate["job"], embedder)
+
+    # Step 2: numbers that are the same for the whole TM.
+    candidates_by_job = collections.defaultdict(list)
+    #sort the candidates by job
+    for candidate in candidates:
+        candidates_by_job[candidate["job_id"]].append(candidate)
+    days_to_first_submission = {}       # for each job: days from the job being created to the first candidate sent
+    for job_id, job_candidates in candidates_by_job.items():
+        sent_dates = [c["created_at"] for c in job_candidates if c["created_at"]] # the dates at which candidates for this job were sent
+        job_created = job_candidates[0]["job"]["created_at"] # the day job was created
+        if sent_dates and job_created:# only continue if both exists
+            days = (min(sent_dates) - job_created).total_seconds() / 86400
+            if 0 <= days <= constants.MAX_DAYS_TO_FIRST_SUBMISSION:
+                days_to_first_submission[job_id] = days       
+    counts = [len(job_candidates) for job_candidates in candidates_by_job.values()] # how many candidates were sent for each job
+    typical_days = 1.0
+    if days_to_first_submission:
+        typical_days = max(float(np.median(list(days_to_first_submission.values()))), 1.0)
+    tm_facts = {"assigned_jobs": prepared["assigned_jobs"], "worked_job_ids": set(candidates_by_job),
+                "days_to_first_submission": days_to_first_submission, "typical_days": typical_days,
+                "typical_candidates_per_job": max(float(np.median(counts)), 1.0)}
+
+    # Step 3: the TM score of every group.
     groups = {}
-    for dim in ("role", "level", "location", "industry"):
-        buckets = collections.defaultdict(list)
-        for c in cands:
-            if c["job"][dim] is not None:
-                buckets[c["job"][dim]].append(c)
-        groups[dim] = {value: stats(rows, dim, value) for value, rows in buckets.items()}
-    typical = {dim: float(np.median([g["score"] for g in gs.values() if g["n"] >= MIN_GROUP_CANDIDATES]))
-               for dim, gs in groups.items() if any(g["n"] >= MIN_GROUP_CANDIDATES for g in gs.values())}
+    for group_type in constants.GROUP_TYPES:
+        candidates_by_group = collections.defaultdict(list)
+        for candidate in candidates:
+            group_value = candidate["job"][group_type]
+            if group_value is not None:
+                candidates_by_group[group_value].append(candidate)
+        groups[group_type] = {}
+        for group_value, group_candidates in candidates_by_group.items():
+            groups[group_type][group_value] = calculate_group_score(group_candidates, group_type, group_value, tm_facts)
 
-    good = collections.Counter()                        # skills of the jobs where the TM's candidates did well
-    for c in cands:
-        if ((c["match"] or 0) >= GOOD_MATCH and not c["early"]) or c["level"] >= CLIENT_LEVEL:
-            good.update(c["job"]["skills"])
-    return {"groups": groups, "typical": typical, "good_skills": good, "n_pool": len(pool_of(cands)), "n_jobs": len(by_job),
-            "n_cands": len(cands)}
+    # Step 4: the typical score of each group type: the middle score of the groups that have enough candidates.
+    typical_scores = {}
+    for group_type, type_groups in groups.items():
+        scores = [g["score"] for g in type_groups.values()]
+        if scores:
+            typical_scores[group_type] = float(np.median(scores))
+
+    # Step 5: the skills of the jobs where the TM's candidates did well.
+    good_skills = collections.Counter()
+    for candidate in candidates:
+        did_well = (candidate["match_score"] or 0) >= constants.GOOD_MATCH_SCORE and not candidate["rejected_early"]
+        if did_well or candidate["stage_level"] >= constants.CLIENT_SHORTLIST_LEVEL:
+            good_skills.update(candidate["job"]["skills"])
+
+    return {"groups": groups, "typical_scores": typical_scores, "good_skills": good_skills, "past_candidates": len(candidates)}
 
 
 # ================================================================================================ SCORE 1: THE JOB FIT
-def score_job(job, tm):
-    """The five parts of the job fit, and the reasons (short and plain). Returns (fit 0-1 or None, confidence, parts, reasons)."""
-    parts, lines = {}, []
-    for dim in ("role", "level", "location", "industry"):
-        value, groups = job[dim], tm["groups"][dim]
-        if value is None:
-            if dim in tm["typical"]:
-                parts[dim] = tm["typical"][dim]
-                lines.append(("~", f"The job does not say its {dim}"))
+def score_job_for_tm(job, profile):
+    """How well one job fits one TM.  It returns: the fit (0 to 1, or None when it cannot be scored), the confidence,
+    the score of each part, and the reasons in three lists: good (supports the fit), watch (a warning) and notes (neutral)."""
+    part_scores = {}
+    good, watch, notes = [], [], []
+
+    # The parts role, level, location and industry: the TM's score in the job's group of that type.
+    for group_type in constants.GROUP_TYPES:
+        group_value = job[group_type]
+        type_groups = profile["groups"][group_type]
+
+        if group_value is None:         # the job does not say it, so the TM's typical score is used
+            if group_type in profile["typical_scores"]:
+                part_scores[group_type] = profile["typical_scores"][group_type]
+                notes.append(f"The job does not say its {group_type}")
             continue
-        if not groups:
-            continue                                    # the TM's history says nothing about this property at all
-        where = {"role": f"{value} jobs", "level": f"{value} level jobs", "location": f"jobs in {value}", "industry": f"{value} industry jobs"}[dim]
-        g = groups.get(value)
-        if g is not None and g["n"] >= MIN_GROUP_CANDIDATES:
-            parts[dim] = g["score"]
-            typ = tm["typical"].get(dim, g["score"])
-            if g["score"] >= typ * 1.05:
-                lines.append(("+", f"Did well on {where}"))
-            elif g["score"] <= typ * 0.9:
-                lines.append(("!", f"Weak results on {where}"))
+        if not type_groups:             # the TM has no history of this type at all
+            continue
+
+        words = helper.group_phrase(group_type, group_value)
+        group = type_groups.get(group_value)
+        if group is not None:
+            part_scores[group_type] = group["score"]
+            typical = profile["typical_scores"].get(group_type, group["score"])
+            if group["score"] >= typical * 1.05:
+                good.append(f"Did well on {words}")
+            elif group["score"] <= typical * 0.9:
+                watch.append(f"Weak results on {words}")
             else:
-                lines.append(("~", f"Average results on {where}"))
+                notes.append(f"Average results on {words}")
+        else:                           # the TM never worked on it, or with too few candidates: a trial
+            part_scores[group_type] = constants.TRIAL_SCORE
+            if group is None:
+                watch.append(f"Has not worked on {words} before")
+            else:
+                watch.append(f"Very few candidates for {words} so far")
+
+    # The skills part: how many of the job's skills appear in the jobs where the TM's candidates did well.
+    # Skills read from the text need at least 3 found, otherwise one stray word could decide the score.
+    has_enough_skills = len(job["skills"]) >= 3 or not job["skills_read_from_text"]
+    if job["skills"] and profile["good_skills"] and has_enough_skills:
+        known_skills = [skill for skill in job["skills"] if skill in profile["good_skills"]]
+        part_scores["skills"] = len(known_skills) / len(job["skills"])
+        if part_scores["skills"] >= 0.5:
+            good.append(f"Knows {len(known_skills)} of the {len(job['skills'])} skills asked")
         else:
-            parts[dim] = UNSEEN_SCORE
-            lines.append(("!", f"Has not worked on {where} before" if g is None else f"Very few candidates for {where} so far"))
-    if job["skills"] and tm["good_skills"] and (not job.get("skills_read_from_text") or len(job["skills"]) >= 3):
-        have = [s for s in job["skills"] if s in tm["good_skills"]]
-        parts["skills"] = len(have) / len(job["skills"])
-        lines.append(("+" if parts["skills"] >= 0.5 else "!", f"Knows {len(have)} of the {len(job['skills'])} skills asked" if parts["skills"] >= 0.5
-                      else f"Knows only {len(have)} of the {len(job['skills'])} skills asked"))
-    if not parts:
-        return None, "Low", parts, lines
-    fit = sum(JOB_FIT_WEIGHTS[k] * v for k, v in parts.items()) / sum(JOB_FIT_WEIGHTS[k] for k in parts)
-    role_g = tm["groups"]["role"].get(job["role"])
-    conf = role_g["confidence"] if role_g is not None and role_g["n"] >= MIN_GROUP_CANDIDATES else "Low"
-    return fit, conf, parts, lines
+            watch.append(f"Knows only {len(known_skills)} of the {len(job['skills'])} skills asked")
+
+    if not part_scores:
+        return None, "Low", part_scores, good, watch, notes
+
+    # The fit: the weighted average of the parts (a missing part is left out and the others share its weight).
+    weights = constants.JOB_FIT_WEIGHTS
+    fit = sum(weights[name] * part_scores[name] for name in part_scores) / sum(weights[name] for name in part_scores)
+
+    # The confidence follows the number of candidates behind the role score.
+    role_group = profile["groups"]["role"].get(job["role"])
+    confidence = "Low"
+    if role_group is not None:
+        confidence = role_group["confidence"]
+    return fit, confidence, part_scores, good, watch, notes

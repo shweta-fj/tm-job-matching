@@ -1,97 +1,89 @@
 """
-main.py  --  for each job, compare it with ALL the talent managers (TMs).
+main.py  --  compares every job with every talent manager (TM) and saves the results.
 
-    1. connect to the database (the connection string is in the .env file)
-    2. pull the ids from the database: every TM id, and the next BATCH_JOBS job ids that are not done yet
-    3. build each TM's scores once
-    4. for each job: score every TM for it (percentage and reasons), and save ALL the TMs of that
-       job in Output/<job_title>_<job_id>.json.  Nothing is shown on the screen.
-    5. next run: the next BATCH_JOBS jobs
+The steps:
+    1. read the connection string from the .env file and connect to the database
+    2. take the TM ids (TM_IDS) and the job ids (JOB_IDS) of constants.py, and read those TMs and jobs from the database
+    3. build the profile of each TM once (how well the TM did in each role, level, city and industry)
+    4. for each job: score every TM for that job (a percentage and the reasons), and save the result in one JSON file
+       Output/<job_title>_<job_id>.json.  Nothing is shown on the screen.
 
 RUN   python main.py        (needs  pip install numpy sentence-transformers pymongo)
 """
 
-import datetime as dt
-import json
 import os
-import re
-import sys
 
-import constants as C
-from matching_engine import (Embedder, MongoSource, build_tm, job_record, norm_email, oid, prepare, score_job, vocab_pattern)
-
-
-# ---- which ids are already done (so every run takes new ones)
-def load_progress():
-    try:
-        data = json.load(open(C.PROGRESS_FILE, encoding="utf-8"))
-    except (OSError, ValueError):
-        data = {}
-    return {"tms": set(data.get("tms", [])), "jobs": set(data.get("jobs", []))}
+import constants
+import helper
+from matching_engine import Embedder, MongoSource, build_tm_profile, prepare_candidates, score_job_for_tm
 
 
-def mark_done(kind, ids):
-    progress = load_progress()
-    progress[kind] |= set(ids)
-    os.makedirs(C.OUTPUT_DIR, exist_ok=True)
-    json.dump({k: sorted(v) for k, v in progress.items()}, open(C.PROGRESS_FILE, "w", encoding="utf-8"))
+def compare_job_with_all_tms(job, tm_profiles): # job- one job record., tm_profiles take two things user(tm records from db) , profile(what script learned about the tm)
+    """Scores every TM for one job.  tm_profiles is a list of (user, profile) pairs.
+    It returns one entry per TM, the best fit first: the TM name, the percentage and one short reason."""
+    results = []                        # a list of (fit, entry) pairs per tm 
+    for user, profile in tm_profiles:
+        fit, confidence, part_scores, good, watch, notes = score_job_for_tm(job, profile)
 
-
-def next_ids(all_ids, done, size, what):
-    """The first `size` ids (in database order) that are not done yet."""
-    ids = [i for i in all_ids if i not in done]
-    if not ids:
-        sys.exit(f"Every {what} is already done ({len(done)}). Delete {C.PROGRESS_FILE} to start again from the first one.")
-    return ids[:size] if size else ids
-
-
-# ---- scoring
-def rank_tms(job, tms):
-    """Every TM of the batch scored for one job, best first. tms = list of (user, profile)."""
-    scored = []
-    for user, profile in tms:
-        fit, conf, parts, lines = score_job(job, profile)
-        good, watch, notes = ([t for m, t in lines if m == mark] for mark in ("+", "!", "~"))
         if fit is None:
-            watch = ["Could not be scored: this TM has no past candidates to learn from"]
-        scored.append((fit, {"tm_id": oid(user["_id"]), "tm_name": user.get("name"), "tm_email": norm_email(user.get("email")),
-                             "past_candidates": profile["n_cands"], "match_percent": None if fit is None else int(round(100 * fit)),
-                             "confidence": conf, "good": good, "watch": watch, "notes": notes,
-                             "parts": {k: round(v, 3) for k, v in parts.items()}}))
-    scored.sort(key=lambda s: -(s[0] if s[0] is not None else -1))
-    return [{"rank": rank, **entry} for rank, (_, entry) in enumerate(scored, 1)]
+            percentage = None
+            reason = "Could not be scored: this TM has no past candidates to learn from"
+        else:
+            percentage = int(round(100 * fit))
+            reason = helper.short_reason(good, watch, notes)
 
+        entry = {"tm_name": user.get("name"),
+                 "tm_id": helper.id_as_text(user["_id"]),     # the id is kept because some TMs have no name in the database
+                 "percentage": percentage,
+                 "reason": reason}
+        results.append((fit, entry))
 
-# ---- output
-def save_job(job, ranked):
-    """One JSON file per job with all the TMs, best first."""
-    name = re.sub(r"[^\w\-]+", "_", str(job["title"] or "no_title")).strip("_")[:40]
-    path = os.path.join(C.OUTPUT_DIR, f"{name}_{job['job_id']}.json")
-    data = {"job": {"id": job["job_id"], "title": job["title"], "role": job["role"], "level": job["level"], "location": job["location"],
-                    "industry": job["industry"], "skills": sorted(job["skills"])},
-            "created": dt.datetime.now().isoformat(timespec="seconds"), "tms_compared": len(ranked), "tms": ranked}
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
-    return path
+    results.sort(key=helper.best_first)         # best Tm first for each job
+
+    ranked = []
+    for fit, entry in results:
+        ranked.append(entry)
+    return ranked
 
 
 def main():
-    source = MongoSource(C.MONGO_URI, C.DATABASE)
-    vocab_regex = vocab_pattern(source.skill_vocab())
-    job_ids = next_ids(source.list_job_ids(), load_progress()["jobs"], C.BATCH_JOBS, "job")
-    users = source.users_by_ids(source.list_tm_ids())    # ALL the TM ids
-    jobs = [job_record(d, vocab_regex) for d in source.jobs_by_ids(job_ids)]
+    # Step 1: connect to the database.
+    helper.load_env(constants.ENV_FILE)
+    connection_string = os.environ.get("MONGO_URI", "")
+    source = MongoSource(connection_string, constants.DATABASE)
 
-    E = Embedder()
-    os.makedirs(C.OUTPUT_DIR, exist_ok=True)
-    tms = []
-    for user in users:                                   # each TM's scores are built once and used for every job
-        tms.append((user, build_tm(prepare(source.tm_raw(oid(user["_id"])), vocab_regex), E)))
+    # Step 2: read the TMs and the jobs of the two lists in constants.py.
+    #get_skill_list()- make list of most commen skills 
+    #make_skill_pattern- turn them into serach pattern (used to find those skills that are not define in jd)
+    skill_pattern = helper.make_skill_pattern(source.get_skill_list()) 
+    # it reads the tm id list 
+    users = source.get_users(constants.TM_IDS)
+    # it take job id and then reads job from database and convert it into title, skills, role, level, location, industry(by make_job)
+    # and add to the jobs list.
+    jobs = []
+    for raw_job in source.get_jobs(constants.JOB_IDS):
+        jobs.append(helper.make_job(raw_job, skill_pattern))
 
+    # Step 3: build the profile of each TM once; it is used for every job.
+    embedder = Embedder()
+    #create output folder if not exist
+    os.makedirs(constants.OUTPUT_DIR, exist_ok=True)
+    # empty list- it holds one profile for each TM
+    tm_profiles = []
+    # goes through tm one by one
+    for user in users:
+        #id_as_text turns the id into plain text first then it reads everything about the tm from database.
+        tm_data = source.get_tm_data(helper.id_as_text(user["_id"]))
+        # turn the data into list of past candidates each with there sections.
+        prepared = prepare_candidates(tm_data, skill_pattern)
+        # build the Tm profile
+        tm_profiles.append((user, build_tm_profile(prepared, embedder)))
+
+    # Step 4: compare each job with all the TMs and save one JSON file per job.
     for job in jobs:
-        ranked = rank_tms(job, tms)
-        save_job(job, ranked)
-        mark_done("jobs", [job["job_id"]])               # only after its file is saved
+        #score every tm for the particular jobs and return them best first, each with the name, percentage and short reason
+        ranked = compare_job_with_all_tms(job, tm_profiles)
+        helper.save_job_file(job, ranked)
 
 
 if __name__ == "__main__":
