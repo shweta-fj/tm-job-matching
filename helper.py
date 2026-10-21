@@ -368,6 +368,36 @@ def group_phrase(group_type, value):
     return f"{value} industry jobs"
 
 
+def explain_calculation(part_scores):
+    """Shows how the percentage is made from the scores of the parts (role, level, skills, location, industry).
+    Each score is rounded to 2 decimals, then multiplied by the weight of its part (this gives the points of the part).
+    The points are added up and divided by the total weight of the parts that exist.
+    It returns the scores, the points, the totals, the result and the percentage.  With no scores it returns empty values."""
+    weights = constants.JOB_FIT_WEIGHTS
+    scores = {}
+    points = {}
+    total_points = 0.0
+    total_weight = 0
+    for part_name in weights:                       # the same order every time: role, level, skills, location, industry
+        if part_name not in part_scores:
+            continue                                # a part with no data is left out, and the others share its weight
+        score = round(part_scores[part_name], 2)
+        weight = weights[part_name]
+        part_points = round(score * weight, 2)
+        scores[part_name] = score
+        points[part_name] = f"{score:.2f} x {weight} = {part_points:.2f}"
+        total_points += part_points
+        total_weight += weight
+
+    if total_weight == 0:
+        return {"fit": None, "percentage": None, "scores": {}, "points": {}, "total_points": None, "total_weight": None, "result": None}
+    total_points = round(total_points, 2)
+    fit = total_points / total_weight
+    percentage = int(round(100 * fit))
+    return {"fit": fit, "percentage": percentage, "scores": scores, "points": points, "total_points": total_points,
+            "total_weight": total_weight, "result": f"{total_points:.2f} / {total_weight} = {percentage}%"}
+
+
 def save_job_file(job, ranked_tms):
     """Saves the result of one job as a JSON file in the Output folder: the job name, then every TM (best first) with the
     percentage and a short reason.  Returns the file path."""

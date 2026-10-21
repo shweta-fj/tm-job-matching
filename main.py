@@ -26,17 +26,22 @@ def compare_job_with_all_tms(job, tm_profiles): # job- one job record., tm_profi
         fit, confidence, part_scores, good, watch, notes = score_job_for_tm(job, profile)
 
         if fit is None:
-            percentage = None
             reason = "Could not be scored: this TM has no past candidates to learn from"
+            calculation = helper.explain_calculation({})                # an empty calculation: nothing to show
         else:
-            percentage = int(round(100 * fit))
             reason = helper.short_reason(good, watch, notes)
+            calculation = helper.explain_calculation(part_scores)       # how the percentage is made from the part scores
 
         entry = {"tm_name": user.get("name"),
                  "tm_id": helper.id_as_text(user["_id"]),     # the id is kept because some TMs have no name in the database
-                 "percentage": percentage,
-                 "reason": reason}
-        results.append((fit, entry))
+                 "percentage": calculation["percentage"],
+                 "reason": reason,
+                 "scores": calculation["scores"],             # the score of each part (0 to 1)
+                 "points": calculation["points"],             # each score x its weight
+                 "total_points": calculation["total_points"],
+                 "total_weight": calculation["total_weight"],
+                 "result": calculation["result"]}
+        results.append((calculation["fit"], entry))                     # sorted below by the fit that comes from the shown scores
 
     results.sort(key=helper.best_first)         # best Tm first for each job
 
